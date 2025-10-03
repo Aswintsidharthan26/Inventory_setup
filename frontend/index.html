@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mobile Red LED Detector</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            padding: 20px;
+            background-color: #f4f4f4;
+        }
+        #video-container {
+            position: relative;
+            width: 90%;
+            max-width: 400px;
+            margin: 0 auto;
+            border: 5px solid #ccc;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+            background-color: black;
+        }
+        #video-feed {
+            width: 100%;
+            display: block;
+            background-color: black;
+        }
+        #overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+        #status {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 8px;
+            font-weight: bold;
+            background-color: #fff;
+            color: #333;
+            min-height: 50px;
+        }
+        #switch-camera-btn {
+            margin-top: 10px;
+            padding: 10px 15px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        #detection-canvas {
+            display: none; 
+        }
+        .red-alert {
+            animation: flash-red 0.5s infinite alternate;
+            background-color: #ffcccc !important;
+            color: #cc0000 !important;
+        }
+        @keyframes flash-red {
+            from { background-color: #ffdddd; }
+            to { background-color: #ff7777; }
+        }
+    </style>
+</head>
+<body>
+
+    <h1>🚨 Red LED Detector</h1>
+    <p>Point your camera at a bright red light to test the SMS alert.</p>
+
+    <div id="video-container">
+        <video id="video-feed" autoplay playsinline></video>
+        <div id="overlay"></div>
+    </div>
+    
+    <button id="switch-camera-btn">Switch to Front (User) Camera</button>
+
+    <div id="status">Waiting for camera...</div>
+
+    <canvas id="detection-canvas"></canvas>
+
+    <script>
+        const video = document.getElementById('video-feed');
+        const canvas = document.getElementById('detection-canvas');
+        const ctx = canvas.getContext('2d');
+        const statusDiv = document.getElementById('status');
+        const overlay = document.getElementById('overlay');
+        const switchBtn = document.getElementById('switch-camera-btn');
+
+        // --- Configuration ---
+        // !!! REPLACE THIS WITH YOUR DEPLOYED FASTAPI URL !!!
+        const SMS_API_ENDPOINT = 'http://127.0.0.1:8000/alert'; 
+        const RED_PIXEL_THRESHOLD = 500;
+        const SMS_COOLDOWN_SECONDS = 60;
+        
+        // --- Global State ---
+        let currentFacingMode = "environment"; // Starts with the back camera
+        let stream = null; // Variable to hold the current media stream
+        let lastSmsTime = 0;
+        let alertSent = false;
+
+        // --- Camera Setup ---
+        async function startCamera() {
+            // 1. Stop any existing stream tracks
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+            }
+            
+            // 2. Define the constraints based on current mode
+            const constraints = {
+                video: { 
+                    facingMode: currentFacingMode 
+                }, 
+                audio: false 
+            };
+
+            try {
+                stream = await navigator.mediaDevices.getUserMedia(constraints);
+                video.srcObject = stream;
+                statusDiv.textContent = `Camera started (${currentFacingMode}). Analyzing feed...`;
+
+                // 3. Update the button text
+                if (currentFacingMode === "environment") {
+                    switchBtn.textContent = "Switch to Front (User) Camera";
+                } else {
+                    switchBtn.textContent = "Switch to Back (Environment) Camera";
+                }
+                
+                // 4. Set canvas size and start processing loop once metadata is loaded
+                video.onloadedmetadata = () => {
+                    video.play();
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    requestAnimationFrame(processFrame);
+                };
+
+            } catch (err) {
+                console.error("Error accessing camera: ", err);
+                statusDiv.textContent = `Error: Could not access camera. Ensure permissions are granted.`;
+            }
+        }
+
+        // --- Image Processing Loop ---
+        function processFrame() {
+            if (video.paused || video.ended) return;
+
+            // 1. Draw the frame onto the canvas
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+            // 2. Get the raw pixel data
+            const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+            let redPixelCount = 0;
+
+            // 3. Iterate over pixels (R, G, B, A)
+            for (let i = 0; i < data.length; i += 4) {
+                const r = data[i];     
+                const g = data[i + 1]; 
+                const b = data[i + 2]; 
+
+                // Simple RGB check for bright red
+                if (r > 200 && r > (g * 1.5) && r > (b * 1.5)) {
+                    redPixelCount++;
+                }
+            }
+            
+            // 4. Detection Logic
+            if (redPixelCount > RED_PIXEL_THRESHOLD) {
+                overlay.style.backgroundColor = 'rgba(255, 0, 0, 0.4)';
+                statusDiv.classList.add('red-alert');
+                statusDiv.textContent = `🔴 RED DETECTED (${redPixelCount} pixels)!`;
+
+                if (!alertSent) {
+                    sendSmsAlert();
+                }
+            } else {
+                overlay.style.backgroundColor = 'transparent';
+                statusDiv.classList.remove('red-alert');
+                if (!alertSent) {
+                    statusDiv.textContent = `🟢 No Red Light Detected. (${redPixelCount} pixels)`;
+                }
+            }
+
+            // 5. Loop for the next frame
+            requestAnimationFrame(processFrame);
+        }
+
+        // --- Communication with Backend API ---
+        async function sendSmsAlert() {
+            const now = Date.now() / 1000;
+            if (now - lastSmsTime < SMS_COOLDOWN_SECONDS) {
+                statusDiv.textContent = '⚠️ RED DETECTED! SMS on cooldown.';
+                return;
+            }
+
+            alertSent = true;
+            statusDiv.textContent = '📲 Sending SMS alert...';
+            
+            try {
+                const response = await fetch(SMS_API_ENDPOINT, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: "Red LED detected by mobile camera." }) 
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.success) {
+                    lastSmsTime = now;
+                    alertSent = false;
+                    statusDiv.textContent = `✅ ALERT SENT! (Next alert possible in ${SMS_COOLDOWN_SECONDS}s)`;
+                } else {
+                    throw new Error(data.detail || data.error || 'Unknown API error');
+                }
+
+            } catch (error) {
+                console.error("SMS API Error:", error);
+                alertSent = false;
+                statusDiv.textContent = `❌ API FAILED: ${error.message}. Check backend server.`;
+            }
+        }
+
+        // --- Button Event Listener ---
+        switchBtn.addEventListener('click', () => {
+            // Toggle the camera mode
+            currentFacingMode = (currentFacingMode === "environment") ? "user" : "environment";
+            // Restart the camera with the new mode
+            startCamera();
+        });
+
+        // Start everything when the page loads
+        window.onload = startCamera;
+    </script>
+
+</body>
+</html>
